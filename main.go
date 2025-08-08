@@ -335,7 +335,8 @@ func handleQuery(cfg *Config) http.HandlerFunc {
 
 		hash := firstNonEmpty(md5q, sha1q, sha256q)
 		if hash == "" {
-			httpErrorJSON(w, http.StatusBadRequest, errors.New("missing hash (md5/sha1/sha256)"))
+			// No hash provided → treat as not found, but respond 200 to keep SandBlast-compatible semantics
+			writeJSON(w, http.StatusOK, SBQueryResp{Found: false, StatusCode: 200})
 			return
 		}
 
