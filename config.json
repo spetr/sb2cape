@@ -1,0 +1,10 @@
+{
+  "listen_addr": ":8080",
+  "cape_base_url": "http://127.0.0.1:8000",
+  "cape_api_token": "",
+  "cape_upload_path": "/apiv2/tasks/create/file",
+  "cape_status_path": "/apiv2/tasks/view/{id}",
+  "cape_report_path": "/apiv2/tasks/report/{id}",
+  "poll_interval": "5s",
+  "request_log_unknown_uri": true
+}
