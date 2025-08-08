@@ -49,6 +49,16 @@ type SBStatusResp struct {
 	StatusCode int    `json:"status_code"` // 100=processing, 200=done, 400/500=error
 }
 
+type SBQueryResp struct {
+	Found      bool   `json:"found"`
+	TaskID     string `json:"task_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+	StatusCode int    `json:"status_code"`
+	MD5        string `json:"md5,omitempty"`
+	SHA1       string `json:"sha1,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+}
+
 type SBReportResp = map[string]any // volné pole; vracíme JSON ve stylu SandBlast
 
 // in-memory map task_id -> CAPE task id (nebo analýza)
@@ -56,6 +66,12 @@ var taskMap = struct {
 	sync.RWMutex
 	m map[string]int
 }{m: make(map[string]int)}
+
+// in-memory map hash -> SandBlast task_id
+var hashIndex = struct {
+	sync.RWMutex
+	m map[string]string // lowercased hash -> sbTask
+}{m: make(map[string]string)}
 
 func main() {
 	cfg := loadConfig()
@@ -65,6 +81,7 @@ func main() {
 	mux.HandleFunc("/tecloud/api/v1/file/upload", withLogging(cfg, handleUpload(cfg)))
 	mux.HandleFunc("/tecloud/api/v1/file/status", withLogging(cfg, handleStatus(cfg)))
 	mux.HandleFunc("/tecloud/api/v1/file/report", withLogging(cfg, handleReport(cfg)))
+	mux.HandleFunc("/tecloud/api/v1/file/query", withLogging(cfg, handleQuery(cfg)))
 
 	// fallback – loguj neznámé cesty (ať vidíš co tvůj klient zkouší)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -208,10 +225,20 @@ func handleUpload(cfg *Config) http.HandlerFunc {
 		taskMap.m[sbTask] = taskID
 		taskMap.Unlock()
 
+		md5Hex := hex.EncodeToString(md5h[:])
+		sha1Hex := hex.EncodeToString(sha1h[:])
+		sha256Hex := hex.EncodeToString(sha256h[:])
+
+		hashIndex.Lock()
+		hashIndex.m[strings.ToLower(md5Hex)] = sbTask
+		hashIndex.m[strings.ToLower(sha1Hex)] = sbTask
+		hashIndex.m[strings.ToLower(sha256Hex)] = sbTask
+		hashIndex.Unlock()
+
 		resp := SBUploadResp{
-			MD5:        hex.EncodeToString(md5h[:]),
-			SHA1:       hex.EncodeToString(sha1h[:]),
-			SHA256:     hex.EncodeToString(sha256h[:]),
+			MD5:        md5Hex,
+			SHA1:       sha1Hex,
+			SHA256:     sha256Hex,
 			StatusCode: 100, // accepted/processing
 			TaskID:     sbTask,
 		}
@@ -281,6 +308,85 @@ func handleReport(cfg *Config) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, sbReport)
 	}
+}
+
+// --- /tecloud/api/v1/file/query endpoint and helpers ---
+
+func handleQuery(cfg *Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Support both GET with query params and POST with JSON body
+		var md5q = strings.TrimSpace(strings.ToLower(r.URL.Query().Get("md5")))
+		var sha1q = strings.TrimSpace(strings.ToLower(r.URL.Query().Get("sha1")))
+		var sha256q = strings.TrimSpace(strings.ToLower(r.URL.Query().Get("sha256")))
+
+		if md5q == "" && sha1q == "" && sha256q == "" && r.Method == http.MethodPost && strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				md5q = strings.TrimSpace(strings.ToLower(body["md5"]))
+				sha1q = strings.TrimSpace(strings.ToLower(body["sha1"]))
+				if sha256q == "" {
+					sha256q = strings.TrimSpace(strings.ToLower(body["sha256"]))
+				}
+				if sha256q == "" {
+					sha256q = strings.TrimSpace(strings.ToLower(body["sha256sum"]))
+				}
+			}
+		}
+
+		hash := firstNonEmpty(md5q, sha1q, sha256q)
+		if hash == "" {
+			httpErrorJSON(w, http.StatusBadRequest, errors.New("missing hash (md5/sha1/sha256)"))
+			return
+		}
+
+		// Find sbTask by hash
+		sbTask, ok := findTaskByHash(hash)
+		if !ok {
+			// Not found – return a SandBlast-like response saying not found
+			writeJSON(w, http.StatusOK, SBQueryResp{Found: false, StatusCode: 200})
+			return
+		}
+		capeID, ok := mapTask(sbTask)
+		if !ok {
+			// We've seen the hash, but mapping was lost – treat as not found
+			writeJSON(w, http.StatusOK, SBQueryResp{Found: false, StatusCode: 200})
+			return
+		}
+
+		st, err := capeStatus(cfg, capeID, r.Context())
+		if err != nil {
+			httpErrorJSON(w, http.StatusBadGateway, err)
+			return
+		}
+
+		resp := SBQueryResp{
+			Found:      true,
+			TaskID:     sbTask,
+			Status:     sandblastStatusFromCAPE(st),
+			StatusCode: sandblastStatusCodeFromCAPE(st),
+			MD5:        md5q,
+			SHA1:       sha1q,
+			SHA256:     sha256q,
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+func findTaskByHash(h string) (string, bool) {
+	h = strings.ToLower(strings.TrimSpace(h))
+	hashIndex.RLock()
+	defer hashIndex.RUnlock()
+	sbTask, ok := hashIndex.m[h]
+	return sbTask, ok
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // --- CAPE client (udrž schválně konfigurovatelné cesty, CAPE má různé varianty API) ---
